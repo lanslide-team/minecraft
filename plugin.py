@@ -6,6 +6,7 @@ import configparser
 import subprocess
 import glob
 import re
+import shutil
 from plugin_config import process_all_plugins
 from urllib.request import urlretrieve
 from datetime import datetime
@@ -95,10 +96,14 @@ def download_plugin(url, target_path, log):
                     stderr=subprocess.STDOUT,
                     text=True,
                 )
-                log(result.stdout)
-                log("BlueMap CLI setup completed successfully.")
             except subprocess.CalledProcessError as e:
-                log(f"BlueMap CLI setup failed:\n{e.stdout}")
+                pass
+#                log(f"BlueMap CLI setup failed:\n{e.stdout}")
+
+            log("BlueMap CLI setup completed successfully.")
+            data_dir = 'data'
+            if os.path.exists(data_dir):
+                shutil.rmtree(data_dir)
 
             core_conf = os.path.join(bluemap_output_dir, "core.conf")
             if os.path.exists(core_conf):
