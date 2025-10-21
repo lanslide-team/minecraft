@@ -1,339 +1,261 @@
 #!/usr/bin/env python3
-import os
-import sys
+from __future__ import annotations
+
 import argparse
 import configparser
-import subprocess
 import glob
+import os
 import re
 import shutil
+import subprocess
+import sys
+import zipfile
+import yaml
+
 from plugin_config import process_all_plugins
-from urllib.request import urlretrieve
+from urllib.request import urlretrieve, build_opener, install_opener
 from datetime import datetime
 
-CONFIG_FILE = "plugins.ini"
-LOG_DIR = "logs"
+class Plugin:
+    LOG_DIR_NAME: str = "logs"
+    TEMP_DIR_NAME: str = "temp"
+    PLUGIN_DIR: str = "plugins"
+    CONFIG_FILE: str = "plugins.ini"
 
+    def __init__(self) -> None:
+        parser = argparse.ArgumentParser(description="Discover or update plugins (silent; logs to file).")
+        parser.add_argument("--only", metavar="PLUGIN", help="Only act on a single plugin")
+        parser.add_argument("--base-dir", default="minecraft-docker", help="Base directory")
 
-def _ensure_dir(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
+        # Updating plugins, keep track of these
+        self.args = parser.parse_args()
+        self.base_dir: str = os.path.abspath(self.args.base_dir)
+        self.current_target = None
+        self.current_plugin = None
+        self.log_dir = os.path.join(self.base_dir, self.LOG_DIR_NAME)
+        self.temp_dir = os.path.join(self.base_dir, self.TEMP_DIR_NAME)
+        self.target_dir = None
 
+        self.log(f"Base directory: {self.base_dir}")
+        Plugin._ensure_dir(self.base_dir)
+        Plugin._ensure_dir(self.log_dir)
+        Plugin._ensure_dir(self.temp_dir)
 
-def _log(base_dir, plugin_name, message):
-    _ensure_dir(os.path.join(base_dir, LOG_DIR))
-    log_path = os.path.join(base_dir, LOG_DIR, f"{plugin_name}.log")
-    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
-    with open(log_path, "a") as f:
-        f.write(f"{timestamp} {message}\n")
-    print(f"[{plugin_name}] {message}")
+        for target in ['build', 'map']:
+            Plugin._ensure_dir(os.path.join(self.base_dir, target, Plugin.PLUGIN_DIR))
 
+        # Force user-agent on downloads
+        opener = build_opener()
+        opener.addheaders = [("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")]
+        install_opener(opener)
 
-def get_installed_version(plugin_name, target_dir, cleanup_globs):
-    for pattern in cleanup_globs:
-        for path in glob.glob(os.path.join(target_dir, pattern)):
-            basename = os.path.basename(path).lower()
-            match = re.match(
-                r"([a-zA-Z0-9\-]+)-([0-9\-\.]+)(?:-\w+)?(\.jar|\.zip)$", basename
-            )
-            if match:
-                return match.group(2)
-    return None
+        # Read Config
+        self.config_path = os.path.join(self.args.base_dir, self.CONFIG_FILE)
+        self.config = configparser.ConfigParser()
+        self.config.read(self.config_path)
+        self.config_updated = False
 
+        targets_plugins = {
+            section.split(":", 1)[1].lower(): dict(self.config[section])
+            for section in self.config.sections()
+            if section.startswith("plugin:")
+        }
 
-def get_config_version(plugin_cfg, plugin_name):
-    url = plugin_cfg.get("url")
-    if url:
-        version_match = re.search(r"(\d+(\.\d+)+[-\w]*)", url)
-        if version_match:
-            return version_match.group(0)
-    return plugin_name
+        self.selected_plugins = targets_plugins
+        if self.args.only:
+            if self.args.only not in targets_plugins:
+                self.log(f"No such plugin in registry: {self.args.only}")
+                sys.exit(1)
+            self.selected_plugins = {self.args.only: targets_plugins[self.args.only]}
 
+    def log(self, message: str, save_log: bool = False) -> None:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def get_latest_url(plugin_name, log):
-    t = None
-    try:
-        output = subprocess.check_output(
-            ["python3", "plugin_url.py", plugin_name], text=True
-        ).strip()
-        if output:
-            return output
-    except subprocess.CalledProcessError as e:
-        log(e)
+        path = ''
+        if self.current_plugin:
+            path = f"{self.current_target}/{self.PLUGIN_DIR}/{self.current_plugin}: " if self.current_target is not None else f"{self.current_plugin}: "
+
+        log_message = f"[{timestamp}] {path}{message}"
+
+        print(f"{log_message}")
+        if save_log and self.current_plugin:
+            log_path = os.path.join(self.log_dir, f"{self.current_plugin}.log")
+            with open(log_path, "a") as f:
+                f.write(f"{log_message}\n")
+
+    @staticmethod
+    def _ensure_dir(path):
+        if not os.path.exists(path):
+            os.makedirs(path)
+
+    def save_config(self):
+        with open(self.config_path, "w") as config_file:
+            self.config.write(config_file)
+        self.log(f"Written back to config")
+
+    def process(self):
+        self.log( 'Updating plugins:')
+
+        general_prefer_beta = self.config.getboolean("general", "prefer_beta", fallback=False)
+        general_prefer_newer = self.config.getboolean("general", "prefer_newer", fallback=False)
+
+        for plugin_name, plugin in self.selected_plugins.items():
+            prefer_beta = self.config.getboolean(f"plugin:{plugin_name}", "prefer_beta", fallback=general_prefer_beta)
+            prefer_newer = self.config.getboolean(f"plugin:{plugin_name}", "prefer_newer", fallback=general_prefer_newer)
+            if self.config.getboolean(f"plugin:{plugin_name}", "enabled", fallback=False):
+                self.update_plugin(plugin_name, plugin, prefer_beta, prefer_newer)
+
+        shutil.rmtree(self.temp_dir)
+        self.log(f"Removing temp dir {self.temp_dir}")
+        if self.config_updated:
+            self.save_config()
+            process_all_plugins()
+
+    @staticmethod
+    def get_jar(plugin_dir: str, cleanup_globs: list[str]):
+        for pattern in cleanup_globs:
+            for path in glob.glob(os.path.join(plugin_dir, pattern)):
+                return os.path.basename(path)
         return None
-    return None
 
-def download_plugin(url, target_path, log):
-    try:
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        log(f"Downloading {url} to {target_path}...")
-        urlretrieve(url, target_path)
-        log(f"Downloaded successfully to {target_path}.")
+    def read_plugin(self, cleanup_globs: list[str], use_temp: bool = False):
+        plugin_dir = self.temp_dir if use_temp else self.target_dir
 
-        plugin_name = os.path.basename(target_path).split('-')[0].lower()
+        if jar_path := Plugin.get_jar(plugin_dir, cleanup_globs):
+            with zipfile.ZipFile(os.path.join(plugin_dir, jar_path), 'r') as z:
+                if 'plugin.yml' in z.namelist():
+                    with z.open('plugin.yml') as f:
+                        return yaml.safe_load(f)
 
-        # --- Bluemap special handling ---
-        if plugin_name == "bluemap":
-            # Derive CLI jar URL (replace '-spigot.jar' with '-cli.jar')
-            cli_url = re.sub(r"-spigot\.jar$", "-cli.jar", url)
-            cli_filename = os.path.basename(cli_url)
-            cli_target_path = os.path.join(os.path.dirname(target_path), cli_filename)
+        return None
 
-            log(f"Detected Bluemap — downloading CLI jar: {cli_url}")
-            urlretrieve(cli_url, cli_target_path)
-            log(f"Downloaded Bluemap CLI successfully to {cli_target_path}")
+    def get_latest_url(self, plugin_name, prefer_beta: bool = False):
+        try:
+            beta = '--beta' if prefer_beta else '--stable'
+            output = subprocess.check_output(
+                ["python3", "plugin_url.py", plugin_name, beta], text=True
+            ).strip()
+            if output:
+                return output
+        except subprocess.CalledProcessError as e:
+            self.log(str(e))
+        return None
 
-            # Run CLI to generate default configs
-            bluemap_output_dir = os.path.join(os.path.dirname(target_path), "BlueMap")
-            os.makedirs(bluemap_output_dir, exist_ok=True)
+    def __process_bluemap(self, url: str):
+        print(f"TARGET DIR: {self.target_dir}")
+        # Run CLI to generate default configs
+        bluemap_output_dir = os.path.join(self.target_dir, "BlueMap")
+        os.makedirs(bluemap_output_dir, exist_ok=True)
 
-            log(f"Running BlueMap CLI setup to generate configs in {bluemap_output_dir}...")
-            try:
-                result = subprocess.run(
-                    ["java", "-jar", cli_target_path, "-c", bluemap_output_dir],
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
-            except subprocess.CalledProcessError as e:
-                pass
-#                log(f"BlueMap CLI setup failed:\n{e.stdout}")
+        # Derive CLI jar URL (replace '-spigot.jar' with '-cli.jar')
+        cli_url = re.sub(r"-spigot\.jar$", "-cli.jar", url)
+        cli_filename = os.path.basename(cli_url)
+        cli_target_path = os.path.join(bluemap_output_dir, cli_filename)
 
-            log("BlueMap CLI setup completed successfully.")
-            data_dir = 'data'
-            if os.path.exists(data_dir):
-                shutil.rmtree(data_dir)
+        self.log(f"Detected Bluemap — downloading CLI jar: {cli_url}")
+        urlretrieve(cli_url, cli_target_path)
+        self.log(f"Downloaded Bluemap CLI successfully to {cli_target_path}")
 
-            core_conf = os.path.join(bluemap_output_dir, "core.conf")
-            if os.path.exists(core_conf):
-                with open(core_conf, "r+", encoding="utf-8") as f:
-                    lines = f.readlines()
-                    f.seek(0)
-                    if any(l.strip().startswith("accept-download") for l in lines):
-                        lines = [("accept-download=true\n" if l.strip().startswith("accept-download") else l) for l in
-                                 lines]
-                    else:
-                        lines.append("accept-download=true\n")
-                    f.writelines(lines)
-                    f.truncate()
-                log(f"Set accept-download=true in {core_conf}")
+        self.log(f"Running BlueMap CLI setup to generate configs in {bluemap_output_dir}...")
+        try:
+            subprocess.run(
+                ["java", "-jar", cli_filename, "-c", '.'],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=bluemap_output_dir
+            )
+        except subprocess.CalledProcessError as e:
+            pass
 
-        # --- End Bluemap special handling ---
+        self.log("BlueMap CLI setup completed successfully.")
+        os.remove(cli_target_path)
 
-    except Exception as e:
-        log(f"Error downloading plugin from {url}: {e}")
-        return False
+        core_conf = os.path.join(bluemap_output_dir, "core.conf")
+        if os.path.exists(core_conf):
+            with open(core_conf, "r+", encoding="utf-8") as f:
+                lines = f.readlines()
+                f.seek(0)
+                if any(l.strip().startswith("accept-download") for l in lines):
+                    lines = [("accept-download=true\n" if l.strip().startswith("accept-download") else l) for l in
+                             lines]
+                else:
+                    lines.append("accept-download=true\n")
+                f.writelines(lines)
+                f.truncate()
+            self.log(f"Set accept-download=true in {core_conf}")
 
-    return True
+    def download_plugin(self, url: str, target_path: str):
+        try:
+            self.log(f"Downloading {url} to {target_path}...")
+            urlretrieve(url, target_path)
+            self.log(f"Downloaded successfully to {target_path}.")
+        except Exception as e:
+            self.log(f"Error downloading plugin from {url}: {e}")
+            return False
 
-def normalize_version(version):
-    """Remove any suffix like '-spigot' to make version comparison easier."""
-    return version.split("-")[0]
+        return True
 
-def discover_plugin(base_dir, plugin_name, plugin_cfg):
-    targets = plugin_cfg.get("targets", "build").split(",")
-    cleanup_globs = [
-        g.strip() for g in plugin_cfg.get("cleanup_globs", "").split(",") if g.strip()
-    ]
-    config_version = get_config_version(plugin_cfg, plugin_name)
-    log_function = lambda msg: _log(base_dir, plugin_name, f"{t.strip()}/plugins: {msg}")
-    latest_url = get_latest_url(plugin_name, log_function)
-    latest_version = None
-    if latest_url:
-        latest_version = get_config_version({"url": latest_url}, plugin_name)
+    def update_plugin(self, plugin_name, plugin_cfg, prefer_beta, prefer_newer):
+        targets = plugin_cfg.get("targets", "build").split(",")
+        cleanup_globs = [
+            g.strip() for g in plugin_cfg.get("cleanup_globs", "").split(",") if g.strip()
+        ]
 
-    for t in targets:
-        target_dir = os.path.join(base_dir, t.strip() + "/plugins")
-        _ensure_dir(target_dir)
-        installed_version = get_installed_version(plugin_name, target_dir, cleanup_globs)
+        for target in targets:
+            self.current_target = target
+            self.current_plugin = plugin_name
+            self.target_dir = os.path.join(self.base_dir, target, self.PLUGIN_DIR)
 
-        if not installed_version:
-            installed_version = config_version
-            if config_version == latest_version:
-                log_function(f"not installed ({installed_version})")
-            else:
-                log_function(f"not installed ({config_version} → {latest_version})")
-        else:
-            normalized_installed = normalize_version(installed_version)
-            normalized_latest = normalize_version(latest_version) if latest_version else None
-            normalized_config = normalize_version(config_version)
-
-            if normalized_installed != normalized_latest:
-                log_function(f"update available ({normalized_installed} → {normalized_latest})")
-            elif normalized_installed != normalized_config:
-                log_function(
-                    f"config version mismatch ({normalized_installed} → {normalized_config} [c])"
-                )
-            else:
-                log_function(f"already up-to-date ({normalized_installed})")
-
-
-def version_tuple(v):
-    return tuple(int(x) for x in re.findall(r"\d+", v))
-
-
-def update_plugin(base_dir, plugin_name, plugin_cfg, prefer_newer=True):
-    targets = plugin_cfg.get("targets", "build").split(",")
-    cleanup_globs = [
-        g.strip() for g in plugin_cfg.get("cleanup_globs", "").split(",") if g.strip()
-    ]
-    log_function = lambda msg: _log(base_dir, plugin_name, f"{t.strip()}/plugins: {msg}")
-    latest_url = get_latest_url(plugin_name, log_function)
-    latest_version = None
-    if latest_url:
-        latest_version = get_config_version({"url": latest_url}, plugin_name)
-
-    for t in targets:
-        target_dir = os.path.join(base_dir, t.strip() + "/plugins")
-        _ensure_dir(target_dir)
-        installed_version = get_installed_version(plugin_name, target_dir, cleanup_globs)
-
-        normalized_installed = normalize_version(installed_version) if installed_version else None
-        normalized_latest = normalize_version(latest_version) if latest_version else None
-
-        need_update = (
-            normalized_installed is None
-            or version_tuple(normalized_installed) < version_tuple(normalized_latest)
-        )
-
-        if need_update and latest_url:
-            for pattern in cleanup_globs:
-                for path in glob.glob(os.path.join(target_dir, pattern)):
-                    os.remove(path)
-
-            jar_name = os.path.basename(latest_url)
-            target_path = os.path.join(target_dir, jar_name)
-
-            if not download_plugin(latest_url, target_path, log_function):
+            url = self.get_latest_url(plugin_name, prefer_beta) if prefer_newer else plugin_cfg['url']
+            if not url:
+                self.log(f"No URL found for {plugin_name}, skipping.")
                 continue
 
-            if installed_version is None:
-                log_function(f"installing {latest_version}")
-            else:
-                log_function(f"updated {installed_version} → {latest_version}")
-
-            plugin_cfg["url"] = latest_url
-
-            config = configparser.ConfigParser()
-            config_path = os.path.join(base_dir, CONFIG_FILE)
-            config.read(config_path)
-            section_name = f"plugin:{plugin_name}"
-            if not config.has_section(section_name):
-                config.add_section(section_name)
-            for key, value in plugin_cfg.items():
-                config.set(section_name, key, str(value))
-            with open(config_path, "w") as config_file:
-                config.write(config_file)
-
-            log_function(f"version updated in config to {normalized_latest}")
-        else:
-            log_function(f"already up-to-date ({normalized_installed})")
-
-def sync_plugin(base_dir, plugin_name, plugin_cfg):
-    """
-    Install the plugin version specified in the config, ignoring latest URLs.
-    """
-    targets = plugin_cfg.get("targets", "build").split(",")
-    cleanup_globs = [g.strip() for g in plugin_cfg.get("cleanup_globs", "").split(",") if g.strip()]
-    config_version = get_config_version(plugin_cfg, plugin_name)
-    url = plugin_cfg.get("url")
-    if not url:
-        _log(base_dir, plugin_name, "No URL in config, skipping.")
-        return
-
-    for t in targets:
-        target_dir = os.path.join(base_dir, t.strip() + "/plugins")
-        _ensure_dir(target_dir)
-        installed_version = get_installed_version(plugin_name, target_dir, cleanup_globs)
-
-        normalized_installed = normalize_version(installed_version) if installed_version else None
-        normalized_config = normalize_version(config_version)
-
-        if normalized_installed != normalized_config:
-            # Remove old versions
-            for pattern in cleanup_globs:
-                for path in glob.glob(os.path.join(target_dir, pattern)):
-                    os.remove(path)
-
             jar_name = os.path.basename(url)
-            target_path = os.path.join(target_dir, jar_name)
-            if download_plugin(url, target_path, lambda msg: _log(base_dir, plugin_name, f"{t.strip()}/plugins: {msg}")):
-                if installed_version is None:
-                    _log(base_dir, plugin_name, f"{t.strip()}/plugins: installing {config_version}")
+            temp_path = os.path.join(self.temp_dir, jar_name)
+            target_path = os.path.join(self.target_dir, jar_name)
+            self.download_plugin(url, temp_path)
+
+            local_plugin = self.read_plugin(cleanup_globs, False)
+            temp_plugin = self.read_plugin(cleanup_globs, True)
+
+            if temp_plugin:
+                if local_plugin:
+                    do_update = False
+                    if temp_plugin['version'] == local_plugin['version']:
+                        self.log(f"Versions match [{temp_plugin['version']}], no update required.")
+                    else:
+                        self.log(f"Update available: {local_plugin['version']} → {temp_plugin['version']}")
+                        do_update = input("Proceed with new version? [y/Y]: ").lower() == 'y'
+
+                    # Clean up old versions
+                    if do_update:
+                        for pattern in cleanup_globs:
+                            for path in glob.glob(os.path.join(self.target_dir, pattern)):
+                                os.remove(path)
                 else:
-                    _log(base_dir, plugin_name, f"{t.strip()}/plugins: updated {installed_version} → {config_version}")
+                    # No local version, force download
+                    self.log(f"Update available: {temp_plugin['version']}")
+                    do_update = True
+
+                if do_update:
+                    self.log(f"Moving {temp_path} to {target_path}...")
+                    shutil.move(temp_path, target_path)
+                    plugin_cfg["url"] = url
+                    self.config_updated = True
+
+                    if plugin_name.lower() == 'bluemap':
+                        self.__process_bluemap(url)
             else:
-                _log(base_dir, plugin_name, f"{t.strip()}/plugins: failed to download {config_version}")
-        else:
-            _log(base_dir, plugin_name, f"{t.strip()}/plugins: already in sync ({config_version})")
+                self.log("Failed to download plugin")
 
-def main():
-    parser = argparse.ArgumentParser(description="Discover or update plugins (silent; logs to file).")
-    parser.add_argument("--debug", action="store_true", help="Enable debug output")
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    def add_common(sp):
-        sp.add_argument("--only", metavar="PLUGIN", help="Only act on a single plugin")
-        sp.add_argument("--base-dir", default="minecraft-docker", help="Base directory")
-
-    sp_discover = sub.add_parser("discover")
-    add_common(sp_discover)
-
-    sp_update = sub.add_parser("update")
-    add_common(sp_update)
-    sp_update.add_argument("--prefer-newer", action="store_true")
-
-    sp_sync = sub.add_parser("sync")
-    add_common(sp_sync)
-
-    args = parser.parse_args()
-
-    config = configparser.ConfigParser()
-    config_path = os.path.join(args.base_dir, CONFIG_FILE)
-    config.read(config_path)
-
-    targets_plugins = {
-        section.split(":", 1)[1].lower(): dict(config[section])
-        for section in config.sections()
-        if section.startswith("plugin:")
-    }
-
-    base_dir = os.path.abspath(args.base_dir)
-    _ensure_dir(base_dir)
-
-    selected_plugins = targets_plugins
-    if args.only:
-        key = args.only.lower()
-        if key not in targets_plugins:
-            _log(base_dir, "general", f"No such plugin in registry: {key}")
-            return 1
-        selected_plugins = {key: targets_plugins[key]}
-
-    _log(base_dir, "general", f"Base directory: {base_dir}")
-
-    if args.command == "discover":
-        _log(base_dir, "general", "Discovery results (no changes):")
-        for k, p in selected_plugins.items():
-            discover_plugin(base_dir, k, p)
-        return 0
-
-    if args.command == "update":
-        _log(base_dir, "general", "Updating plugins:")
-        for k, p in selected_plugins.items():
-            update_plugin(base_dir, k, p, prefer_newer=args.prefer_newer)
-        process_all_plugins()
-        return 0
-
-    if args.command == "sync":
-        _log(base_dir, "general", "Syncing plugins to config versions:")
-        for k, p in selected_plugins.items():
-            sync_plugin(base_dir, k, p)
-        process_all_plugins()
-        return 0
-
-    return 0
+        self.current_target = None
+        self.current_plugin = None
+        self.target_dir = None
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    plugin = Plugin()
+    plugin.process()

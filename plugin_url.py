@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, json, re, requests
+import sys, json, os, re, requests
 
 # --------------------------
 # Utility Functions
@@ -19,20 +19,28 @@ def extract_version(s):
 def modrinth_latest(slug, beta=False):
     """Fetch the latest Modrinth version, preferring Spigot/Bukkit/Paper jars."""
     try:
-        r = requests.get(f"https://api.modrinth.com/v2/project/{slug}/version", timeout=10).json()
+        r = requests.get(
+            f"https://api.modrinth.com/v2/project/{slug}/version",
+            headers={"User-Agent": "plugin-updater-script/1.0"},
+            timeout=10
+        ).json()
+
         best_url, best_ver = None, "0"
         for v in r:
             ver = v.get("version_number") or v.get("name") or "0"
             if not beta and "beta" in ver.lower():
                 continue
             for f in v.get("files", []):
-                fn = f["url"].lower()
+                fn = f["url"].lower().split("?")[0]
                 if not fn.endswith(".jar"):
                     continue
-                # Only pick Spigot/Bukkit/Paper jars
-                if any(x in fn for x in ["velocity", "bungee", "fabric", "cli"]):
+                if any(x in fn for x in ["velocity", "bungee", "fabric", "cli", "quilt", "forge"]):
                     continue
-                if version_tuple(ver) > version_tuple(best_ver):
+                # Optional: prefer bukkit/paper
+                priority = 0
+                if "paper" in fn: priority += 2
+                if "bukkit" in fn: priority += 1
+                if version_tuple(ver) > version_tuple(best_ver) or (version_tuple(ver) == version_tuple(best_ver) and priority > 0):
                     best_ver = ver
                     best_url = f["url"]
         return best_url
@@ -53,7 +61,14 @@ def github_latest(repo_url, beta=False):
         if not m:
             return None
         repo = m.group(1)
-        releases = requests.get(f"https://api.github.com/repos/{repo}/releases", timeout=10).json()
+
+        github_token = os.getenv("GITHUB_TOKEN")
+        headers = {}
+        if github_token:
+#            headers["User-Agent"] = "plugin-updater-script/1.0"
+            headers["Authorization"] = f"token {github_token}"
+
+        releases = requests.get(f"https://api.github.com/repos/{repo}/releases", headers=headers, timeout=10).json()
 
         best_url = None
         best_priority = 0  # 3=Spigot/Bukkit, 2=Paper, 1=Other
@@ -97,7 +112,11 @@ def hangar_latest(url, beta=False):
         if not m:
             return None
         author, project = m.group(1), m.group(2)
-        r = requests.get(f"https://hangar.papermc.io/api/v1/projects/{author}/{project}/versions", timeout=10).json()["result"]
+        r = requests.get(
+            f"https://hangar.papermc.io/api/v1/projects/{author}/{project}/versions",
+            headers={"User-Agent": "plugin-updater-script/1.0"},
+            timeout=10
+        ).json()["result"]
 
         # Sort descending by version number
         versions = sorted(r, key=lambda v: version_tuple(v["name"]), reverse=True)

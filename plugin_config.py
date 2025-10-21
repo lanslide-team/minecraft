@@ -3,7 +3,6 @@ import zipfile
 import os
 import shutil
 import yaml
-import re
 
 def get_official_plugin_name(jar_path):
     try:
@@ -40,7 +39,8 @@ def extract_configs(jar_path, target_root, log=None):
 
     with zipfile.ZipFile(jar_path, 'r') as z:
         for f in z.namelist():
-            if f.endswith(('.yml', '.conf', '.json', '.txt')):
+            # '.txt'
+            if f.endswith(('.yml', '.conf', '.json')):
                 dest_dir = plugin_dir
                 dest_file = os.path.join(dest_dir, os.path.basename(f))
                 os.makedirs(dest_dir, exist_ok=True)
@@ -48,7 +48,7 @@ def extract_configs(jar_path, target_root, log=None):
                 with z.open(f) as src, open(dest_file, 'wb') as dst:
                     dst.write(src.read())
 
-def process_all_plugins(target_root=".", log=None):
+def process_all_plugins(target_root="minecraft-docker", log=None):
     """Automatically find JARs in subfolders and extract configs."""
     for root, dirs, files in os.walk(target_root):
         for item in files:
