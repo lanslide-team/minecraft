@@ -3,6 +3,9 @@
 cd minecraft-docker
 VERSION=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "latest")
 
+docker rm spigot-build-config -f
+docker rm spigot-map-config -f
+
 sudo chmod -R 777 ./build/plotworld 2>/dev/null || true
 sudo chmod 777 ./build/plugins
 sudo chmod 777 ./map/plugins
@@ -32,6 +35,7 @@ while ! docker exec spigot-build-config test -d /mc/plotworld; do
 done
 
 docker cp spigot-build-config:/mc/plotworld ./build/plotworld
+docker cp spigot-build-config:/mc/bukkit.yml ./build/
 
 sleep 10
 
