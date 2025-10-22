@@ -23,7 +23,7 @@ def clear_subdirectories(plugin_dir, log=None):
             if log:
                 log(f"Cleared subdirectory {item_path}")
 
-def extract_configs(jar_path, target_root, log=None):
+def extract_configs(jar_path, log=None):
     plugin_name = get_official_plugin_name(jar_path)
     if plugin_name.lower() == "bluemap":
         return
@@ -54,7 +54,7 @@ def process_all_plugins(target_root="minecraft-docker", log=None):
         for item in files:
             if item.endswith(".jar"):
                 jar_path = os.path.join(root, item)
-                extract_configs(jar_path, target_root, log)
+                extract_configs(jar_path, log)
 
 if __name__ == "__main__":
     def log(msg): print(msg)

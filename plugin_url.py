@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 import sys, json, os, re, requests
+import xml.etree.ElementTree as ET
+from dotenv import load_dotenv
+
+USER_AGENT = "plugin-updater-script/1.0"
 
 # --------------------------
 # Utility Functions
@@ -65,7 +69,7 @@ def github_latest(repo_url, beta=False):
         github_token = os.getenv("GITHUB_TOKEN")
         headers = {}
         if github_token:
-#            headers["User-Agent"] = "plugin-updater-script/1.0"
+            headers["User-Agent"] = USER_AGENT
             headers["Authorization"] = f"token {github_token}"
 
         releases = requests.get(f"https://api.github.com/repos/{repo}/releases", headers=headers, timeout=10).json()
@@ -114,7 +118,7 @@ def hangar_latest(url, beta=False):
         author, project = m.group(1), m.group(2)
         r = requests.get(
             f"https://hangar.papermc.io/api/v1/projects/{author}/{project}/versions",
-            headers={"User-Agent": "plugin-updater-script/1.0"},
+            headers={"User-Agent": USER_AGENT},
             timeout=10
         ).json()["result"]
 
@@ -130,6 +134,42 @@ def hangar_latest(url, beta=False):
         return None
     except Exception as e:
         print(f"Hangar error: {e}", file=sys.stderr)
+        return None
+
+def maven_latest(url, beta=False):
+    """
+    Fetch the latest Maven Central JAR for the given mvnrepository.com artifact
+    by reading the Maven metadata XML.
+    Example URL: https://mvnrepository.com/artifact/com.intellectualsites/plotsquared/plotsquared-bukkit
+    """
+    try:
+        # Extract groupId and artifactId from URL
+        m = re.search(r"mvnrepository\.com/artifact/([^/]+)/([^/]+)", url)
+        if not m:
+            return None
+        group_id, artifact_id = m.group(1), m.group(2)
+
+        # Construct metadata.xml URL
+        group_path = group_id.replace(".", "/")
+        metadata_url = f"https://repo1.maven.org/maven2/{group_path}/{artifact_id}/maven-metadata.xml"
+
+        # Fetch and parse XML
+        r = requests.get(metadata_url, headers={"User-Agent": USER_AGENT}, timeout=10)
+        if r.status_code != 200:
+            print(f"Error fetching metadata: {r.status_code}", file=sys.stderr)
+            return None
+
+        root = ET.fromstring(r.text)
+        latest_version = root.find("./versioning/latest").text
+
+        # Construct download URL
+        jar_name = f"{artifact_id}-{latest_version}.jar"
+        download_url = f"https://repo1.maven.org/maven2/{group_path}/{artifact_id}/{latest_version}/{jar_name}"
+
+        return download_url
+
+    except Exception as e:
+        print(f"Maven error: {e}", file=sys.stderr)
         return None
 
 # --------------------------
@@ -159,6 +199,8 @@ def get_latest(plugin_name, beta=False):
             result = github_latest(url, beta=beta)
         elif "hangar.papermc.io" in url:
             result = hangar_latest(url, beta=beta)
+        elif "mvnrepository.com" in url:
+            result = maven_latest(url, beta=beta)
         if result:
             return result
     return None
@@ -171,6 +213,7 @@ if __name__ == "__main__":
         print("Usage: plugin-url.py <plugin_name> [--beta | --stable]", file=sys.stderr)
         sys.exit(1)
 
+    load_dotenv()
     plugin_name = sys.argv[1]
     beta_flag = False
     if len(sys.argv) > 2 and sys.argv[2].lower() == "--beta":
