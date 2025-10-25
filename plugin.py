@@ -12,7 +12,6 @@ import sys
 import zipfile
 import yaml
 
-from plugin_config import process_all_plugins
 from urllib.request import urlretrieve, build_opener, install_opener
 from datetime import datetime
 
@@ -122,7 +121,6 @@ class Plugin:
         self.log(f"Removing temp dir {self.temp_dir}", level=2)
         if self.config_updated:
             self.save_config()
-            process_all_plugins()
 
     @staticmethod
     def get_jar(plugin_dir: str, cleanup_globs: list[str]):
